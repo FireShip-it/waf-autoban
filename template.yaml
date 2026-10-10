@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WAF Auto-Ban - Score-based IP blocking with Lambda and DynamoDB
+
+Parameters:
+  WebAclArn:
+    Type: String
+    Description: ARN of the WAF Web ACL to protect
+  
+  WebAclScope:
+    Type: String
+    Default: REGIONAL
+    AllowedValues:
+      - REGIONAL
+      - CLOUDFRONT
+    Description: Scope of the WAF Web ACL
+  
+  BanThreshold:
+    Type: Number
+    Default: 10
+    Description: Score required to trigger a ban
+  
+  BanDurationMinutes:
+    Type: Number
+    Default: 60
+    Description: How long an IP stays banned (minutes)
+  
+  ScorePerBlock:
+    Type: Number
+    Default: 1
+    Description: Points added per BLOCK event
+  
+  EnforcerScheduleMinutes:
+    Type: Number
+    Default: 1
+    Description: How often the enforcer runs (minutes)
+
+Resources:
+
+  # DynamoDB table for IP scores
+  ScoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-scores'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: waf-autoban
+
+  # WAF IP Set for banned IPs
+  BanIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub '${AWS::StackName}-banlist'
+      Scope: !Ref WebAclScope
+      IPAddressVersion: IPV4
+      Addresses: []
+      Tags:
+        - Key: Application
+          Value: waf-autoban
+
+  # IAM role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ScoreTable.Arn
+        - PolicyName: WAFAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:UpdateIPSet
+                Resource: !GetAtt BanIpSet.Arn
+
+  # Scorer Lambda function
+  ScorerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scorer'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ScoreTable
+          BAN_THRESHOLD: !Ref BanThreshold
+          BAN_DURATION_MINUTES: !Ref BanDurationMinutes
+          SCORE_PER_BLOCK: !Ref ScorePerBlock
+      Code:
+        ZipFile: |
+          import json
+          import gzip
+          import base64
+          import os
+          import time
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+          BAN_THRESHOLD = int(os.environ['BAN_THRESHOLD'])
+          BAN_DURATION = int(os.environ['BAN_DURATION_MINUTES']) * 60
+          SCORE_PER_BLOCK = int(os.environ['SCORE_PER_BLOCK'])
+
+          def handler(event, context):
+              # Decode CloudWatch Logs subscription filter payload
+              payload = base64.b64decode(event['awslogs']['data'])
+              log_data = json.loads(gzip.decompress(payload))
+              
+              for log_event in log_data.get('logEvents', []):
+                  try:
+                      waf_log = json.loads(log_event['message'])
+                      process_waf_log(waf_log)
+                  except Exception as e:
+                      print(f"Error processing log: {e}")
+              
+              return {'statusCode': 200}
+
+          def process_waf_log(waf_log):
+              # Extract source IP
+              ip = waf_log.get('httpRequest', {}).get('clientIp')
+              if not ip:
+                  return
+              
+              # Skip if not a BLOCK action
+              if waf_log.get('action') != 'BLOCK':
+                  return
+              
+              now = int(time.time())
+              ban_expiry = now + BAN_DURATION
+              
+              # Update score in DynamoDB
+              response = table.update_item(
+                  Key={'ip': ip},
+                  UpdateExpression='SET score = if_not_exists(score, :zero) + :inc, updated_at = :now, ttl = :ttl',
+                  ExpressionAttributeValues={
+                      ':zero': Decimal(0),
+                      ':inc': Decimal(SCORE_PER_BLOCK),
+                      ':now': Decimal(now),
+                      ':ttl': Decimal(ban_expiry + 3600)  # TTL 1 hour after ban expires
+                  },
+                  ReturnValues='ALL_NEW'
+              )
+              
+              new_score = int(response['Attributes']['score'])
+              
+              # If score exceeds threshold, set ban expiry
+              if new_score >= BAN_THRESHOLD:
+                  table.update_item(
+                      Key={'ip': ip},
+                      UpdateExpression='SET ban_until = :ban_until',
+                      ExpressionAttributeValues={
+                          ':ban_until': Decimal(ban_expiry)
+                      }
+                  )
+                  print(f"Banned IP {ip} until {ban_expiry} (score: {new_score})")
+              else:
+                  print(f"Scored IP {ip}: {new_score}/{BAN_THRESHOLD}")
+
+  # Permission for CloudWatch Logs to invoke scorer
+  ScorerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScorerFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  # Enforcer Lambda function
+  EnforcerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-enforcer'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ScoreTable
+          IP_SET_NAME: !Sub '${AWS::StackName}-banlist'
+          IP_SET_ID: !GetAtt BanIpSet.Id
+          IP_SET_SCOPE: !Ref WebAclScope
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          wafv2 = boto3.client('wafv2')
+
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          IP_SET_NAME = os.environ['IP_SET_NAME']
+          IP_SET_ID = os.environ['IP_SET_ID']
+          IP_SET_SCOPE = os.environ['IP_SET_SCOPE']
+
+          def handler(event, context):
+              now = int(time.time())
+              
+              # Scan for all IPs with active bans
+              banned_ips = []
+              response = table.scan(
+                  FilterExpression='ban_until > :now',
+                  ExpressionAttributeValues={':now': now}
+              )
+              
+              for item in response.get('Items', []):
+                  ip = item['ip']
+                  # Add CIDR notation if not present
+                  if '/' not in ip:
+                      ip = f"{ip}/32"
+                  banned_ips.append(ip)
+              
+              # Handle pagination
+              while 'LastEvaluatedKey' in response:
+                  response = table.scan(
+                      FilterExpression='ban_until > :now',
+                      ExpressionAttributeValues={':now': now},
+                      ExclusiveStartKey=response['LastEvaluatedKey']
+                  )
+                  for item in response.get('Items', []):
+                      ip = item['ip']
+                      if '/' not in ip:
+                          ip = f"{ip}/32"
+                      banned_ips.append(ip)
+              
+              # Get current IP Set
+              ip_set = wafv2.get_ip_set(
+                  Name=IP_SET_NAME,
+                  Scope=IP_SET_SCOPE,
+                  Id=IP_SET_ID
+              )
+              
+              current_ips = set(ip_set['IPSet']['Addresses'])
+              new_ips = set(banned_ips)
+              
+              # Only update if changed
+              if current_ips != new_ips:
+                  wafv2.update_ip_set(
+                      Name=IP_SET_NAME,
+                      Scope=IP_SET_SCOPE,
+                      Id=IP_SET_ID,
+                      Addresses=list(new_ips),
+                      LockToken=ip_set['LockToken']
+                  )
+                  print(f"Updated IP Set: {len(new_ips)} banned IPs")
+                  print(f"Added: {new_ips - current_ips}")
+                  print(f"Removed: {current_ips - new_ips}")
+              else:
+                  print(f"No changes. {len(current_ips)} IPs currently banned.")
+              
+              return {'statusCode': 200, 'bannedCount': len(new_ips)}
+
+  # EventBridge rule to trigger enforcer
+  EnforcerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-enforcer-schedule'
+      ScheduleExpression: !Sub 'rate(${EnforcerScheduleMinutes} minute)'
+      State: ENABLED
+      Targets:
+        - Id: EnforcerTarget
+          Arn: !GetAtt EnforcerFunction.Arn
+
+  # Permission for EventBridge to invoke enforcer
+  EnforcerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnforcerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EnforcerSchedule.Arn
+
+Outputs:
+  ScoreTableName:
+    Description: DynamoDB table for IP scores
+    Value: !Ref ScoreTable
+  
+  BanIpSetArn:
+    Description: ARN of the WAF IP Set for banned IPs
+    Value: !GetAtt BanIpSet.Arn
+  
+  BanIpSetId:
+    Description: ID of the WAF IP Set (use this in your Web ACL rule)
+    Value: !GetAtt BanIpSet.Id
+  
+  ScorerFunctionArn:
+    Description: ARN of the scorer Lambda function
+    Value: !GetAtt ScorerFunction.Arn
+  
+  EnforcerFunctionArn:
+    Description: ARN of the enforcer Lambda function
+    Value: !GetAtt EnforcerFunction.Arn
+  
+  SubscriptionFilterCommand:
+    Description: Command to create the CloudWatch Logs subscription filter
+    Value: !Sub |
+      aws logs put-subscription-filter \
+        --log-group-name YOUR_WAF_LOG_GROUP \
+        --filter-name ${AWS::StackName}-scorer \
+        --filter-pattern '{ $.action = "BLOCK" }' \
+        --destination-arn ${ScorerFunction.Arn}
